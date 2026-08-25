@@ -1,0 +1,135 @@
+# /etc/llama-otel-proxy/config.yaml
+#
+# Every key is optional; omitting one keeps the default shown here. Values are
+# validated at startup and anything invalid — an out-of-range sampling rate, an
+# upstream without a scheme, a mistyped key — stops the process rather than
+# being quietly corrected.
+
+# Address llamaproxy listens on. Clients point here instead of at llama-swap.
+#
+# Loopback by default, and widening it is a security decision: llamaproxy has no
+# authentication and no TLS, and it forwards every path llama-swap serves — the
+# log stream, the event stream and the admin UI, not just inference. Put it
+# behind an authenticating proxy or a firewall before binding it anywhere
+# reachable.
+listen: 127.0.0.1:8081
+
+# The llama-swap HTTP(S) base URL. Credentials, query and fragment are rejected;
+# validation errors do not echo the raw URL.
+upstream: http://127.0.0.1:8080
+
+# Sampling rate in percent, decimals allowed (e.g. 2.5). 0 drops everything,
+# 100 keeps everything.
+#
+# Keep this at 100 in production. The Collector derives call counts and latency
+# histograms from the spans that reach it, so sampling here skews both; sample
+# downstream of the spanmetrics connector instead. Treat this as an escape hatch
+# for load testing or a full tracing backend. Anything below 100 logs a warning
+# at startup.
+sample_percent: 100
+
+# Whether the SERVER span name carries the model ("chat qwen3") or stays fixed
+# ("chat", with the model in attributes only). The CLIENT span is unaffected: it
+# always follows the GenAI convention and is named "chat qwen3".
+#
+# This is not a cardinality control. gen_ai.request.model stays a spanmetrics
+# dimension either way, so the number of series still follows the number of
+# distinct models. The limit that actually bounds it is
+# aggregation_cardinality_limit in the Collector.
+model_in_span_name: false
+
+# Whether an incoming traceparent header may set this proxy's trace id.
+#
+# true keeps distributed traces joined up, which is what you want when the
+# callers are your own services. false starts a local root and keeps the
+# incoming context as a span link instead: a caller can then no longer merge
+# unrelated requests into one trace, inject spans into a trace you are looking
+# at, or steer a tail sampler by reusing trace ids. Set it to false where the
+# callers are not trusted. false also removes incoming traceparent, tracestate
+# and baggage; instrumented requests then receive the new local context.
+trust_incoming_trace_context: true
+
+# Maximum number of *instrumented* requests handled concurrently: the POSTs to
+# the whitelisted inference paths, which are the ones that buffer a request body
+# and hold SSE parser state. Sizing follows from that per-request cost.
+# At the limit, new instrumented requests receive 503 plus Retry-After. Must be
+# positive.
+max_concurrent_requests: 16
+
+# Maximum number of pass-through requests handled concurrently: everything not
+# instrumented, including the admin UI, upgraded connections and the endless
+# /logs/stream and /api/events subscriptions.
+#
+# This is a separate budget on purpose. A pass-through request costs a goroutine,
+# one 32 KiB copy buffer and an upstream connection — two orders of magnitude
+# less than an instrumented one — and these streams stay open for as long as a
+# browser tab is left open. Charging them to max_concurrent_requests would let a
+# handful of idle UI tabs answer every inference request with 503. Must be
+# positive.
+max_concurrent_passthrough_requests: 128
+
+# How much of a request body is buffered for inspection, in MiB. The body is
+# always forwarded in full; this only bounds what llamaproxy reads to derive
+# gen_ai.request.* and the recorded body. Past the limit only the top-level
+# fields that appear before the cut are recognised. Must be 1..512.
+request_body_limit_mib: 4
+
+# net/http ReadTimeout for a request's headers and body. Headers also have a
+# separate fixed 15-second ReadHeaderTimeout; a value below 15s does not lower
+# that cap. This bounds slow uploads, not response generation. Must be positive.
+request_read_timeout: 30s
+
+# How long a session span stays open waiting for the next turn of the same
+# X-Session-Id. It ends this long after the last turn finished, stamped with
+# that turn's end time so an idle wait never inflates the session duration.
+# Raise it for clients that pause between turns; lower it to see session roots
+# in the backend sooner. Must be positive.
+session_idle_timeout: 5m
+
+otel:
+  # Reported as service.name on every span. Must not be empty.
+  service_name: llamaproxy
+
+  # OTLP transport: http/protobuf (the default) or grpc. "http" and "https" are
+  # accepted as aliases for http/protobuf; the endpoint's scheme, not this key,
+  # decides whether the connection uses TLS. Collectors usually listen on 4318
+  # for http/protobuf and 4317 for grpc, so change the endpoint port along with
+  # this key.
+  protocol: http/protobuf
+
+  # Collector endpoint. Under http/protobuf a host root gets /v1/traces; a
+  # non-root path is the complete traces path and is used as-is. Under grpc the
+  # endpoint must be a host root: gRPC has no request path, so a path here is a
+  # mistake and is rejected rather than silently ignored. Credentials, query and
+  # fragment are rejected in both cases; put authentication in headers below. A
+  # non-empty YAML value overrides OTEL_EXPORTER_OTLP_ENDPOINT and
+  # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT. Leave it
+  # empty to hand endpoint selection back to those variables and then the
+  # exporter default. TLS material, compression and the exporter timeout still
+  # use the standard OTEL_EXPORTER_OTLP_* environment variables because this
+  # file does not expose them. Malformed endpoint/header/timeout/compression
+  # values and unreadable TLS files fail safely without being echoed.
+  # OTEL_EXPORTER_OTLP_PROTOCOL is not consulted: the transport comes from the
+  # protocol key above.
+  endpoint: http://127.0.0.1:4318
+
+  # Sent with every export request, for backends that need authentication. A
+  # non-empty map overrides OTEL_EXPORTER_OTLP_HEADERS and
+  # OTEL_EXPORTER_OTLP_TRACES_HEADERS; an empty map permits their fallback.
+  #
+  # This is why the packaged file is installed 0600 and passed to the service
+  # through systemd's LoadCredential= rather than read from /etc directly, and
+  # why a startup failure never quotes a value from this file.
+  #
+  # Names must be HTTP tokens and values must not carry control characters;
+  # either is rejected at startup rather than failing later on every export.
+  #headers:
+  #  authorization: Bearer <token>
+
+  # Added to the resource on every span. service.name and telemetry.sdk.* are
+  # reserved and rejected: set service.name through service_name above, and let
+  # the SDK identify itself. OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES are
+  # ignored with a startup warning.
+  #resource_attributes:
+  #  deployment.environment: prod
+  #  host.name: gpu01
